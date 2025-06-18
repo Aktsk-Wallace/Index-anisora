@@ -355,7 +355,7 @@ def generate(args):
         opt_dir=args.image
         with open(args.prompt,"r",encoding="gbk")as f:
             lines=f.read().strip("\n").split("\n")
-        logging.info("Creating WanI2V pipeline.")
+        logging.info("Creating WanFLF2V pipeline.")
         wan_flf2v = wan.WanFLF2V(
             config=cfg,
             checkpoint_dir=args.ckpt_dir,
