@@ -41,6 +41,10 @@ bash scripts/finetune/finetune_wan.sh
 python generate-pi-i2v.py --task i2v-14B --size 960*544 --ckpt_dir Wan2.1-I2V-14B-480P --image output_videos --prompt data/inference.txt --base_seed 4096 --frame_num 49
 ```
 
+```bash
+python generate-pi-i2v.py --task flf2v --size 960*544 --ckpt_dir Wan2.1-FLF2V-14B-720P --image output_videos --prompt data/inference.txt --base_seed 4096 --frame_num 49
+```
+
 #### Multi-GPU Inference
 
 ```bash

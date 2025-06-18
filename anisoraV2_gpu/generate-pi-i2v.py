@@ -47,7 +47,7 @@ def _validate_args(args):
 
     # The default sampling steps are 40 for image-to-video tasks and 50 for text-to-video tasks.
     if args.sample_steps is None:
-        args.sample_steps = 40 if "i2v" in args.task else 50
+        args.sample_steps = 40 if "i2v" in args.task or "flf2v" in args.task else 50
 
     if args.sample_shift is None:
         args.sample_shift = 5.0
@@ -338,6 +338,82 @@ def generate(args):
                     nrow=1,
                     normalize=True,
                     value_range=(-1, 1))
+    elif "flf2v" in args.task:
+        if args.prompt is None:
+            args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
+        if args.image is None:
+            args.image = EXAMPLE_PROMPT[args.task]["image"]
+        logging.info(f"Input prompt: {args.prompt}")
+        logging.info(f"Input image: {args.image}")
+
+        opt_dir=args.image
+        with open(args.prompt,"r",encoding="gbk")as f:
+            lines=f.read().strip("\n").split("\n")
+        logging.info("Creating WanI2V pipeline.")
+        wan_flf2v = wan.WanFLF2V(
+            config=cfg,
+            checkpoint_dir=args.ckpt_dir,
+            device_id=device,
+            rank=rank,
+            t5_fsdp=args.t5_fsdp,
+            dit_fsdp=args.dit_fsdp,
+            use_usp=(args.ulysses_size > 1 or args.ring_size > 1),
+            t5_cpu=args.t5_cpu,
+        )
+
+        for idx,line in enumerate(lines):
+            args.save_file="%s/%s.mp4"%(opt_dir,idx)
+            prompt,images=line.split("@@")
+            images = images.split(",")
+            args.first_frame=images[0]
+            if len(images) > 1:
+                args.last_frame = images[1]
+            args.prompt=prompt
+            img = Image.open(args.image).convert("RGB")
+            if args.use_prompt_extend:
+                logging.info("Extending prompt ...")
+                if rank == 0:
+                    prompt_output = prompt_expander(
+                        args.prompt,
+                        tar_lang=args.prompt_extend_target_lang,
+                        image=img,
+                        seed=args.base_seed)
+                    if prompt_output.status == False:
+                        logging.info(
+                            f"Extending prompt failed: {prompt_output.message}")
+                        logging.info("Falling back to original prompt.")
+                        input_prompt = args.prompt
+                    else:
+                        input_prompt = prompt_output.prompt
+                    input_prompt = [input_prompt]
+                else:
+                    input_prompt = [None]
+                if dist.is_initialized():
+                    dist.broadcast_object_list(input_prompt, src=0)
+                args.prompt = input_prompt[0]
+                logging.info(f"Extended prompt: {args.prompt}")
+            logging.info("Generating video ...")
+            if os.path.exists(args.save_file)==False:
+                video = wan_flf2v.generate(
+                    args.prompt+" There is no text in the video.",
+                    args.first_frame,
+                    args.last_frame,
+                    max_area=MAX_AREA_CONFIGS[args.size],
+                    frame_num=args.frame_num,
+                    shift=args.sample_shift,
+                    sample_solver=args.sample_solver,
+                    sampling_steps=args.sample_steps,
+                    guide_scale=args.sample_guide_scale,
+                    seed=args.base_seed,
+                    offload_model=args.offload_model)
+                if rank==0:
+                    cache_video(
+                        tensor=video[None],
+                        save_file=args.save_file,
+                        fps=cfg.sample_fps,
+                        nrow=1,
+                        normalize=True,
+                        value_range=(-1, 1))
     else:
         if args.prompt is None:
             args.prompt = EXAMPLE_PROMPT[args.task]["prompt"]
