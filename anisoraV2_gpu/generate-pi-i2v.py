@@ -375,14 +375,15 @@ def generate(args):
             if len(images) > 1:
                 args.last_frame = images[1]
             args.prompt=prompt
-            img = Image.open(args.image).convert("RGB")
+            img_first = Image.open(args.first_frame).convert("RGB")
+            img_last = Image.open(args.last_frame).convert("RGB")
             if args.use_prompt_extend:
                 logging.info("Extending prompt ...")
                 if rank == 0:
                     prompt_output = prompt_expander(
                         args.prompt,
                         tar_lang=args.prompt_extend_target_lang,
-                        image=img,
+                        image=img_first,
                         seed=args.base_seed)
                     if prompt_output.status == False:
                         logging.info(
@@ -402,8 +403,8 @@ def generate(args):
             if os.path.exists(args.save_file)==False:
                 video = wan_flf2v.generate(
                     args.prompt+" There is no text in the video.",
-                    args.first_frame,
-                    args.last_frame,
+                    img_first,
+                    img_last,
                     max_area=MAX_AREA_CONFIGS[args.size],
                     frame_num=args.frame_num,
                     shift=args.sample_shift,
