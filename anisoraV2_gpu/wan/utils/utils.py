@@ -28,13 +28,9 @@ def cache_video(tensor,
                 normalize=True,
                 value_range=(-1, 1),
                 retry=5):
-    # cache file ori
-    # cache_file = osp.join('/tmp', rand_name(
-    #     suffix=suffix)) if save_file is None else save_file
-
-    ###for piliang
-    cache_file=save_file
-    os.makedirs(os.path.dirname(cache_file),exist_ok=True)
+    # cache file
+    cache_file = osp.join('/tmp', rand_name(
+        suffix=suffix)) if save_file is None else save_file
 
     # save to cache
     error = None

@@ -8,8 +8,11 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 
 from .attention import flash_attention
-from fastvideo.utils.communications import gather_sequence,split_sequence,all_to_all_4D
+
 __all__ = ['WanModel']
+
+T5_CONTEXT_TOKEN_NUMBER = 512
+FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER = 257 * 2
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -66,72 +69,6 @@ def rope_apply(x, grid_sizes, freqs):
         output.append(x_i)
     return torch.stack(output).float()
 
-
-def pad_freqs(original_tensor, target_len):
-    seq_len, s1, s2 = original_tensor.shape
-    pad_size = target_len - seq_len
-    padding_tensor = torch.ones(
-        pad_size,
-        s1,
-        s2,
-        dtype=original_tensor.dtype,
-        device=original_tensor.device)
-    padded_tensor = torch.cat([original_tensor, padding_tensor], dim=0)
-    return padded_tensor
-
-
-# @amp.autocast(enabled=False)
-# def rope_apply(x, grid_sizes, freqs,nccl_info):
-#     """
-#     x:          [B, L, N, C].
-#     grid_sizes: [B, 3].
-#     freqs:      [M, C // 2].
-#     """
-#     s, n, c = x.size(1), x.size(2), x.size(3) // 2
-#     # split freqs
-#     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
-#
-#     # loop over samples
-#     output = []
-#     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-#         seq_len = f * h * w
-#
-#         # precompute multipliers
-#         x_i = torch.view_as_complex(x[i, :s].to(torch.float64).reshape(
-#             s, n, -1, 2))
-#         freqs_i = torch.cat([
-#             freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-#             freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-#             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-#         ],
-#                             dim=-1).reshape(seq_len, 1, -1)
-#
-#         print(11111,freqs_i.shape)
-#
-#         # apply rotary embedding
-#         # sp_size = get_sequence_parallel_world_size()
-#         sp_size = nccl_info.sp_size
-#         # sp_rank = get_sequence_parallel_rank()
-#         sp_rank = nccl_info.rank_within_group
-#         freqs_i = pad_freqs(freqs_i, s * sp_size)
-#         print(22222,freqs_i.shape)
-#         s_per_rank = s
-#         freqs_i_rank = freqs_i[(sp_rank * s_per_rank):((sp_rank + 1) *s_per_rank), :, :]
-#         print(33333,freqs_i_rank.shape,x_i.shape)
-#         x_i = torch.view_as_real(x_i * freqs_i_rank).flatten(2)
-#         x_i = torch.cat([x_i, x[i, s:]])
-#         print(44444,x_i.shape)
-#         '''
-#         11111 torch.Size([20280, 1, 64])
-#         22222 torch.Size([20280, 1, 64])
-#         33333 torch.Size([20280, 1, 64]) torch.Size([20280, 40, 64])
-#         44444 torch.Size([20280, 40, 128])
-#         '''
-#         import os
-#         os._exit(23333)
-#         # append to collection
-#         output.append(x_i)
-#     return torch.stack(output).float()
 
 class WanRMSNorm(nn.Module):
 
@@ -190,7 +127,7 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs,nccl_info):
+    def forward(self, x, seq_lens, grid_sizes, freqs):
         r"""
         Args:
             x(Tensor): Shape [B, L, num_heads, C / num_heads]
@@ -208,33 +145,14 @@ class WanSelfAttention(nn.Module):
             return q, k, v
 
         q, k, v = qkv_fn(x)
-        # q=rope_apply(q, grid_sizes, freqs,nccl_info)
-        # k=rope_apply(k, grid_sizes, freqs,nccl_info)
 
-
-        if nccl_info.sp_size>1:
-            q=gather_sequence(q,dim=1,grad_scale="up")
-            k=gather_sequence(k,dim=1,grad_scale="up")
-        q=rope_apply(q, grid_sizes, freqs)
-        k=rope_apply(k, grid_sizes, freqs)
-        if nccl_info.sp_size>1:
-            q=split_sequence(q,dim=1,grad_scale="down")
-            k=split_sequence(k,dim=1,grad_scale="down")
-
-        # print(444444444444,x.shape,q.shape,k.shape,v.shape,x.dtype,q.dtype,k.dtype,v.dtype)#32#32#32#bf16
-        #torch.Size([1, 10140, 5120]) torch.Size([1, 10140, 40, 128]) torch.Size([1, 10140, 40, 128]) torch.Size([1, 10140, 40, 128])#BTHC
-        if nccl_info.sp_size>1:
-            q = all_to_all_4D(q, scatter_dim=2, gather_dim=1)
-            k = all_to_all_4D(k, scatter_dim=2, gather_dim=1)
-            v = all_to_all_4D(v, scatter_dim=2, gather_dim=1)
         x = flash_attention(
-            q=q,
-            k=k,
+            q=rope_apply(q, grid_sizes, freqs),
+            k=rope_apply(k, grid_sizes, freqs),
             v=v,
             k_lens=seq_lens,
             window_size=self.window_size)
-        if nccl_info.sp_size>1:
-            x = all_to_all_4D(x, scatter_dim=1, gather_dim=2)
+
         # output
         x = x.flatten(2)
         x = self.o(x)
@@ -243,7 +161,7 @@ class WanSelfAttention(nn.Module):
 
 class WanT2VCrossAttention(WanSelfAttention):
 
-    def forward(self, x, context, context_lens,nccl_info):
+    def forward(self, x, context, context_lens):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
@@ -281,15 +199,16 @@ class WanI2VCrossAttention(WanSelfAttention):
         # self.alpha = nn.Parameter(torch.zeros((1, )))
         self.norm_k_img = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, context, context_lens,nccl_info):
+    def forward(self, x, context, context_lens):
         r"""
         Args:
             x(Tensor): Shape [B, L1, C]
             context(Tensor): Shape [B, L2, C]
             context_lens(Tensor): Shape [B]
         """
-        context_img = context[:, :257]
-        context = context[:, 257:]
+        image_context_length = context.shape[1] - T5_CONTEXT_TOKEN_NUMBER
+        context_img = context[:, :image_context_length]
+        context = context[:, image_context_length:]
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
         # compute query, key, value
@@ -298,9 +217,10 @@ class WanI2VCrossAttention(WanSelfAttention):
         v = self.v(context).view(b, -1, n, d)
         k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
         v_img = self.v_img(context_img).view(b, -1, n, d)
-
         img_x = flash_attention(q, k_img, v_img, k_lens=None)
+        # compute attention
         x = flash_attention(q, k, v, k_lens=context_lens)
+
         # output
         x = x.flatten(2)
         img_x = img_x.flatten(2)
@@ -363,7 +283,7 @@ class WanAttentionBlock(nn.Module):
         grid_sizes,
         freqs,
         context,
-        context_lens,nccl_info
+        context_lens,
     ):
         r"""
         Args:
@@ -379,13 +299,15 @@ class WanAttentionBlock(nn.Module):
         assert e[0].dtype == torch.float32
 
         # self-attention
-        y = self.self_attn(self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,freqs,nccl_info)
+        y = self.self_attn(
+            self.norm1(x).float() * (1 + e[1]) + e[0], seq_lens, grid_sizes,
+            freqs)
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
 
         # cross-attention & ffn function
         def cross_attn_ffn(x, context, context_lens, e):
-            x = x + self.cross_attn(self.norm3(x), context, context_lens,nccl_info)
+            x = x + self.cross_attn(self.norm3(x), context, context_lens)
             y = self.ffn(self.norm2(x).float() * (1 + e[4]) + e[3])
             with amp.autocast(dtype=torch.float32):
                 x = x + y * e[5]
@@ -427,15 +349,22 @@ class Head(nn.Module):
 
 class MLPProj(torch.nn.Module):
 
-    def __init__(self, in_dim, out_dim):
+    def __init__(self, in_dim, out_dim, flf_pos_emb=False):
         super().__init__()
 
         self.proj = torch.nn.Sequential(
             torch.nn.LayerNorm(in_dim), torch.nn.Linear(in_dim, in_dim),
             torch.nn.GELU(), torch.nn.Linear(in_dim, out_dim),
             torch.nn.LayerNorm(out_dim))
+        if flf_pos_emb:  # NOTE: we only use this for `flf2v`
+            self.emb_pos = nn.Parameter(
+                torch.zeros(1, FIRST_LAST_FRAME_CONTEXT_TOKEN_NUMBER, 1280))
 
     def forward(self, image_embeds):
+        if hasattr(self, 'emb_pos'):
+            bs, n, d = image_embeds.shape
+            image_embeds = image_embeds.view(-1, 2 * n, d)
+            image_embeds = image_embeds + self.emb_pos
         clip_extra_context_tokens = self.proj(image_embeds)
         return clip_extra_context_tokens
 
@@ -449,7 +378,6 @@ class WanModel(ModelMixin, ConfigMixin):
         'patch_size', 'cross_attn_norm', 'qk_norm', 'text_dim', 'window_size'
     ]
     _no_split_modules = ['WanAttentionBlock']
-    _supports_gradient_checkpointing = True
 
     @register_to_config
     def __init__(self,
@@ -473,7 +401,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
         Args:
             model_type (`str`, *optional*, defaults to 't2v'):
-                Model variant - 't2v' (text-to-video) or 'i2v' (image-to-video)
+                Model variant - 't2v' (text-to-video) or 'i2v' (image-to-video) or 'flf2v' (first-last-frame-to-video) or 'vace'
             patch_size (`tuple`, *optional*, defaults to (1, 2, 2)):
                 3D patch dimensions for video embedding (t_patch, h_patch, w_patch)
             text_len (`int`, *optional*, defaults to 512):
@@ -506,7 +434,7 @@ class WanModel(ModelMixin, ConfigMixin):
 
         super().__init__()
 
-        assert model_type in ['t2v', 'i2v']
+        assert model_type in ['t2v', 'i2v', 'flf2v', 'vace']
         self.model_type = model_type
 
         self.patch_size = patch_size
@@ -556,16 +484,11 @@ class WanModel(ModelMixin, ConfigMixin):
         ],
                                dim=1)
 
-        if model_type == 'i2v':
-            self.img_emb = MLPProj(1280, dim)
+        if model_type == 'i2v' or model_type == 'flf2v':
+            self.img_emb = MLPProj(1280, dim, flf_pos_emb=model_type == 'flf2v')
 
         # initialize weights
         self.init_weights()
-        self.gradient_checkpointing = True
-        self.training=False
-
-    def _set_gradient_checkpointing(self, module, value=False):
-        self.gradient_checkpointing = value
 
     def forward(
         self,
@@ -574,7 +497,7 @@ class WanModel(ModelMixin, ConfigMixin):
         context,
         seq_len,
         clip_fea=None,
-        y=None,is_train=False,nccl_info=None
+        y=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -589,7 +512,7 @@ class WanModel(ModelMixin, ConfigMixin):
             seq_len (`int`):
                 Maximum sequence length for positional encoding
             clip_fea (Tensor, *optional*):
-                CLIP image features for image-to-video mode
+                CLIP image features for image-to-video mode or first-last-frame-to-video mode
             y (List[Tensor], *optional*):
                 Conditional video inputs for image-to-video mode, same shape as x
 
@@ -597,20 +520,20 @@ class WanModel(ModelMixin, ConfigMixin):
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
-        self.training=is_train
-        if self.model_type == 'i2v':
+        if self.model_type == 'i2v' or self.model_type == 'flf2v':
             assert clip_fea is not None and y is not None
         # params
         device = self.patch_embedding.weight.device
-
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
+
         # embeddings
         x = [self.patch_embedding(u.unsqueeze(0)) for u in x]
-        grid_sizes = torch.stack([torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
+        grid_sizes = torch.stack(
+            [torch.tensor(u.shape[2:], dtype=torch.long) for u in x])
         x = [u.flatten(2).transpose(1, 2) for u in x]
         seq_lens = torch.tensor([u.size(1) for u in x], dtype=torch.long)
         assert seq_lens.max() <= seq_len
@@ -618,12 +541,14 @@ class WanModel(ModelMixin, ConfigMixin):
             torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
                       dim=1) for u in x
         ])
+
         # time embeddings
         with amp.autocast(dtype=torch.float32):
             e = self.time_embedding(
                 sinusoidal_embedding_1d(self.freq_dim, t).float())
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
             assert e.dtype == torch.float32 and e0.dtype == torch.float32
+
         # context
         context_lens = None
         context = self.text_embedding(
@@ -632,8 +557,9 @@ class WanModel(ModelMixin, ConfigMixin):
                     [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
                 for u in context
             ]))
+
         if clip_fea is not None:
-            context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
+            context_clip = self.img_emb(clip_fea)  # bs x 257 (x2) x dim
             context = torch.concat([context_clip, context], dim=1)
 
         # arguments
@@ -643,34 +569,13 @@ class WanModel(ModelMixin, ConfigMixin):
             grid_sizes=grid_sizes,
             freqs=self.freqs,
             context=context,
-            nccl_info=nccl_info,
             context_lens=context_lens)
-        def create_custom_forward(module):
-            def custom_forward(*inputs, **kwargs):
-                return module(*inputs, **kwargs)
-            return custom_forward
 
-        # Context Parallel
-        if nccl_info.sp_size > 1:
-            x = split_sequence(x, dim=1, grad_scale="down")
-        # for block in self.blocks[:6]:
         for block in self.blocks:
-            if self.training and self.gradient_checkpointing:
-                x = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(block),
-                    x, **kwargs,
-                    use_reentrant=False,
-                )
-            else:
-                x = block(x, **kwargs)
+            x = block(x, **kwargs)
 
-        # # head
+        # head
         x = self.head(x, e)
-
-        # Context Parallel
-        if nccl_info.sp_size > 1:
-            x = gather_sequence(x, dim=1, grad_scale="up")
-
 
         # unpatchify
         x = self.unpatchify(x, grid_sizes)

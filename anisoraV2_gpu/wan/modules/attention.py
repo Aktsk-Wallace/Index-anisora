@@ -20,31 +20,6 @@ __all__ = [
     'attention',
 ]
 
-# try:
-#     # from sageattention import sageattn_varlen#sage1
-#     from sageattention import sageattn  # sage2
-#
-#     print("using sageattn2")
-#
-#
-#     @torch.compiler.disable()
-#     def sageattn_wrapper(
-#             q, k, v,
-#             attention_length
-#     ):
-#         padding_length = q.shape[0] - attention_length
-#         q = q[:attention_length, :, :].unsqueeze(0)
-#         k = k[:attention_length, :, :].unsqueeze(0)
-#         v = v[:attention_length, :, :].unsqueeze(0)
-#
-#         o = sageattn(q, k, v, tensor_layout="NHD").squeeze(0)
-#         if padding_length > 0:
-#             o = torch.cat([o, torch.empty((padding_length, *o.shape[-2:]), dtype=o.dtype, device=o.device)], 0)
-#
-#         return o
-# except:
-#     sageattn_wrapper=None
-#     traceback.print_exc()
 
 def flash_attention(
     q,
@@ -57,7 +32,7 @@ def flash_attention(
     q_scale=None,
     causal=False,
     window_size=(-1, -1),
-    deterministic=True,#False
+    deterministic=False,
     dtype=torch.bfloat16,
     version=None,
 ):
@@ -109,10 +84,6 @@ def flash_attention(
 
     if q_scale is not None:
         q = q * q_scale
-
-    # if type(sageattn_wrapper)!=type(None):
-    #     x = sageattn_wrapper(q, k, v, lq).unsqueeze(0)
-    #     return x.type(out_dtype)
 
     if version is not None and version == 3 and not FLASH_ATTN_3_AVAILABLE:
         warnings.warn(
@@ -170,7 +141,7 @@ def attention(
     q_scale=None,
     causal=False,
     window_size=(-1, -1),
-    deterministic=True,#False
+    deterministic=False,
     dtype=torch.bfloat16,
     fa_version=None,
 ):
