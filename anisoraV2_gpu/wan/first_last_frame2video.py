@@ -273,6 +273,8 @@ class WanFLF2V:
             ],
                          dim=1).to(self.device)
         ])[0]
+        print(f"Shape of msk: {msk.shape}")
+        print(f"Shape of y: {y.shape}")
         y = torch.concat([msk, y])
 
         @contextmanager
