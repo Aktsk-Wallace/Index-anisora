@@ -447,6 +447,7 @@ def generate(args):
         for idx,line in enumerate(lines):
             args.save_file="%s/%s.mp4"%(opt_dir,idx)
             prompt,image=line.split("@@")
+            image=image.split(",")[0]
             args.image=image
             args.prompt=prompt
             img = Image.open(args.image).convert("RGB")
